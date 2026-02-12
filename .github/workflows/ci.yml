@@ -9,6 +9,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  actions: read
 
 jobs:
   build-and-test:
@@ -27,41 +28,153 @@ jobs:
       - name: Test with coverage
         run: go test -coverprofile=coverage.out -covermode=atomic ./...
 
-      - name: Coverage summary
+      - name: Generate coverage report
         if: success()
         id: coverage
         run: |
-          COVERAGE=$(go tool cover -func=coverage.out)
-          TOTAL=$(echo "$COVERAGE" | tail -1 | awk '{print $NF}')
+          REPORT=$(go tool cover -func=coverage.out)
+          TOTAL=$(echo "$REPORT" | tail -1 | awk '{print $NF}')
 
           echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
 
           {
             echo 'report<<EOF'
-            echo "$COVERAGE"
+            echo "$REPORT"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
+
+          # Save total for baseline artifact
+          echo "$TOTAL" > coverage-total.txt
+
+      - name: Upload coverage baseline
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-baseline
+          path: coverage-total.txt
+          overwrite: true
+
+      - name: Download previous baseline
+        if: success() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh run list \
+            --branch main \
+            --status success \
+            --workflow CI \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+
+          if [ -n "$RUN_ID" ]; then
+            gh run download "$RUN_ID" \
+              --name coverage-baseline \
+              --dir /tmp/baseline 2>/dev/null || true
+          fi
+
+      - name: Write job summary
+        if: success()
+        run: |
+          CURRENT="${{ steps.coverage.outputs.total }}"
+
+          # Read previous baseline if available
+          PREVIOUS=""
+          if [ -f /tmp/baseline/coverage-total.txt ]; then
+            PREVIOUS=$(cat /tmp/baseline/coverage-total.txt)
+          fi
+
+          {
+            echo "## Test Coverage"
+            echo ""
+
+            if [ -n "$PREVIOUS" ]; then
+              # Strip % for arithmetic
+              CUR_NUM=${CURRENT%\%}
+              PREV_NUM=${PREVIOUS%\%}
+              DELTA=$(awk "BEGIN {printf \"%.1f\", $CUR_NUM - $PREV_NUM}")
+
+              if (( $(awk "BEGIN {print ($DELTA > 0)}") )); then
+                ICON=":arrow_up:"
+                SIGN="+"
+              elif (( $(awk "BEGIN {print ($DELTA < 0)}") )); then
+                ICON=":arrow_down:"
+                SIGN=""
+              else
+                ICON=":white_check_mark:"
+                SIGN=""
+              fi
+
+              echo "| | Coverage |"
+              echo "|---|---|"
+              echo "| Previous (main) | ${PREVIOUS} |"
+              echo "| Current | ${CURRENT} |"
+              echo "| Delta | ${ICON} ${SIGN}${DELTA}% |"
+            else
+              echo "**Coverage: ${CURRENT}**"
+              echo ""
+              echo "_No baseline from main available yet for comparison._"
+            fi
+
+            echo ""
+            echo "<details>"
+            echo "<summary>Full coverage report</summary>"
+            echo ""
+            echo '```'
+            echo "${{ steps.coverage.outputs.report }}"
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment coverage on PR
         if: success() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          BODY=$(cat <<'COMMENT'
-          ## Test Coverage Report
+          CURRENT="${{ steps.coverage.outputs.total }}"
 
-          **Total: ${{ steps.coverage.outputs.total }}**
+          PREVIOUS=""
+          if [ -f /tmp/baseline/coverage-total.txt ]; then
+            PREVIOUS=$(cat /tmp/baseline/coverage-total.txt)
+          fi
 
-          <details>
-          <summary>Full report</summary>
+          {
+            echo "## Test Coverage Report"
+            echo ""
 
-          ```
-          ${{ steps.coverage.outputs.report }}
-          ```
+            if [ -n "$PREVIOUS" ]; then
+              CUR_NUM=${CURRENT%\%}
+              PREV_NUM=${PREVIOUS%\%}
+              DELTA=$(awk "BEGIN {printf \"%.1f\", $CUR_NUM - $PREV_NUM}")
 
-          </details>
-          COMMENT
-          )
+              if (( $(awk "BEGIN {print ($DELTA > 0)}") )); then
+                SIGN="+"
+              else
+                SIGN=""
+              fi
+
+              echo "| | Coverage |"
+              echo "|---|---|"
+              echo "| Previous (main) | ${PREVIOUS} |"
+              echo "| Current | ${CURRENT} |"
+              echo "| Delta | ${SIGN}${DELTA}% |"
+            else
+              echo "**Coverage: ${CURRENT}**"
+            fi
+
+            echo ""
+            echo "<details>"
+            echo "<summary>Full report</summary>"
+            echo ""
+            echo '```'
+            echo "${{ steps.coverage.outputs.report }}"
+            echo '```'
+            echo ""
+            echo "</details>"
+          } > /tmp/pr-comment.md
+
+          BODY=$(cat /tmp/pr-comment.md)
 
           # Delete previous coverage comments to avoid clutter
           gh api \
